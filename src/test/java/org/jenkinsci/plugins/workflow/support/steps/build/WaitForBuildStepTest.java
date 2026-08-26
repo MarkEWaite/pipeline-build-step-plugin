@@ -1,9 +1,17 @@
 package org.jenkinsci.plugins.workflow.support.steps.build;
 
+import hudson.model.Computer;
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
 import hudson.model.Result;
 import hudson.model.Run;
+import hudson.model.User;
 
+import java.util.Collections;
+import jenkins.model.Jenkins;
+import jenkins.security.QueueItemAuthenticatorConfiguration;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
+import org.jvnet.hudson.test.MockQueueItemAuthenticator;
 import org.jenkinsci.plugins.workflow.actions.WarningAction;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.cps.nodes.StepAtomNode;
@@ -27,6 +35,7 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @WithJenkins
 class WaitForBuildStepTest {
@@ -279,6 +288,45 @@ class WaitForBuildStepTest {
             }
         }
         return null;
+    }
+
+    @Issue("SECURITY-3870")
+    @Test
+    void propagateAbortWithoutCancelPermissionDoesNotAbortDownstream() throws Exception {
+        WorkflowJob ds = createWaitingDownStreamJob("wait", Result.SUCCESS);
+        WorkflowJob us = j.jenkins.createProject(WorkflowJob.class, "us");
+        us.setDefinition(new CpsFlowDefinition(
+                """
+                        def ds = build job: 'ds', waitForStart: true
+                        semaphore 'scheduled'
+                        def dsRunId = "${ds.getFullProjectName()}#${ds.getNumber()}"
+                        waitForBuild runId: dsRunId, propagate: true, propagateAbort: true""", true));
+
+        j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+        // us runs as dev, who may build ds but has no job/cancel on it
+        QueueItemAuthenticatorConfiguration.get().getAuthenticators().add(new MockQueueItemAuthenticator(
+                Collections.singletonMap("us", User.getById("dev", true).impersonate())));
+        j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
+                .grant(Jenkins.READ, Computer.BUILD).everywhere().to("dev")
+                .grant(Item.READ, Item.BUILD).onItems(ds).to("dev"));
+
+        WorkflowRun usRun = us.scheduleBuild2(0).waitForStart();
+        SemaphoreStep.waitForStart("scheduled/1", usRun);
+        SemaphoreStep.success("scheduled/1", true);
+
+        WorkflowRun dsRun = ds.getBuildByNumber(1);
+        SemaphoreStep.waitForStart("wait/1", dsRun);
+        waitForWaitForBuildAction(dsRun);
+
+        usRun.doStop();
+        j.assertBuildStatus(Result.ABORTED, j.waitForCompletion(usRun));
+
+        // dev lacks job/cancel on ds, so the downstream must keep running and a permission message is logged
+        j.assertLogContains("dev is missing the Job/Cancel permission to abort ds", usRun);
+        assertTrue(dsRun.isBuilding(), "downstream ds should still be running");
+
+        SemaphoreStep.success("wait/1", true);
+        j.assertBuildStatus(Result.SUCCESS, j.waitForCompletion(dsRun));
     }
 
     private WorkflowJob createWaitingDownStreamJob(String semaphoreName, Result result) throws Exception {

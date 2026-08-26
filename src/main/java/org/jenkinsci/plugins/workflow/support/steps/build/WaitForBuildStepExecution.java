@@ -104,7 +104,7 @@ public class WaitForBuildStepExecution extends AbstractStepExecutionImpl {
         if (exec instanceof Run) {
             Run<?, ?> downstream = (Run<?, ?>) exec;
             for(WaitForBuildAction waitForBuildAction : downstream.getActions(WaitForBuildAction.class)) {
-                if (waitForBuildAction.context.equals(context)) {
+                if (waitForBuildAction.context.equals(context) && BuildTriggerStepExecution.cancelPermitted(downstream.getParent(), downstream.getParent().getFullDisplayName(), context)) {
                     e.interrupt(Result.ABORTED, new BuildTriggerCancelledCause(cause));
                     try {
                         downstream.save();
@@ -117,5 +117,6 @@ public class WaitForBuildStepExecution extends AbstractStepExecutionImpl {
         }
         return interrupted;
     }
+
 
 }

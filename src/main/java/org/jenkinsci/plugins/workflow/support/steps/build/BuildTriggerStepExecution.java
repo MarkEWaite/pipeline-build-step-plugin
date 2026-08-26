@@ -27,8 +27,11 @@ import hudson.model.StringParameterDefinition;
 import hudson.model.StringParameterValue;
 import hudson.model.TaskListener;
 import hudson.model.queue.ScheduleResult;
+import hudson.model.queue.Tasks;
+import hudson.security.AccessControlled;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
+import org.springframework.security.core.Authentication;
 import org.jenkinsci.plugins.workflow.actions.LabelAction;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
 import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
@@ -230,7 +233,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
         // BuildQueueListener will report the failure, so this method shouldn't call getContext().onFailure()
         for (Queue.Item i : q.getItems()) {
             for (BuildTriggerAction.Trigger trigger : BuildTriggerAction.triggersFor(i)) {
-                if (trigger.context.equals(context)) {
+                if (trigger.context.equals(context) && cancelPermitted(i.task, i.task.getFullDisplayName(), context)) {
                     // Note that it is a little questionable to cancel the queue item in case it has other causes,
                     // but in the common case that this is the only cause, it is most intuitive to do so.
                     // The same applies to aborting the actual build once started.
@@ -261,7 +264,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
         Queue.Executable exec = e.getCurrentExecutable();
         if (exec instanceof Run) {
             for (BuildTriggerAction.Trigger trigger : BuildTriggerAction.triggersFor((Run<?, ?>) exec)) {
-                if (trigger.context.equals(context)) {
+                if (trigger.context.equals(context) && cancelPermitted(((Run<?, ?>) exec).getParent(), ((Run<?, ?>) exec).getParent().getFullDisplayName(), context)) {
                     e.interrupt(Result.ABORTED, new BuildTriggerCancelledCause(cause));
                     trigger.interruption = cause;
                     try {
@@ -275,6 +278,38 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
         }
         return interrupted;
     }
+
+    /**
+     *  only propagate the abort to the downstream if the identity the upstream build runs as has
+     * {@link Item#CANCEL} on it otherwise leave the downstream running and log a message on the upstream build
+     */
+    static boolean cancelPermitted(Object downstream, String downstreamName, StepContext context) {
+        if (!(downstream instanceof AccessControlled ac)) {
+            return true;
+        }
+        Authentication auth;
+        try {
+            if (!(context.get(Run.class).getParent() instanceof Queue.Task task)) {
+                return true;
+            }
+            auth = Tasks.getAuthenticationOf2(task);
+        } catch (IOException | InterruptedException x) {
+            LOGGER.log(Level.WARNING, "failed to determine upstream authentication", x);
+            return true;
+        }
+        if (ac.hasPermission2(auth, Item.CANCEL)) {
+            return true;
+        }
+        try {
+            context.get(TaskListener.class).getLogger().println(auth.getName()
+                    + " is missing the " + Item.CANCEL.group.title + "/" + Item.CANCEL.name
+                    + " permission to abort " + downstreamName);
+        } catch (IOException | InterruptedException x) {
+            LOGGER.log(Level.WARNING, "failed to report missing cancel permission", x);
+        }
+        return false;
+    }
+
 
     @Override public String getStatus() {
         for (Queue.Item i : Queue.getInstance().getItems()) {

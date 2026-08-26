@@ -56,6 +56,7 @@ import jenkins.security.QueueItemAuthenticatorConfiguration;
 
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.arrayWithSize;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
@@ -98,6 +99,7 @@ import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 @WithJenkins
@@ -967,6 +969,71 @@ class BuildTriggerStepTest {
             cause.print(tl);
         }
         assertThat(writer.toString(), containsString("ds #1 completed with status FAILURE"));
+    }
+
+    @Issue("SECURITY-3870")
+    @Test
+    void abortWithoutCancelPermissionDoesNotAbortDownstream() throws Exception {
+        FreeStyleProject ds = j.createFreeStyleProject("ds");
+        ds.getBuildersList().add(new SleepBuilder(Long.MAX_VALUE));
+        WorkflowJob us = j.jenkins.createProject(WorkflowJob.class, "us");
+        us.setDefinition(new CpsFlowDefinition("build 'ds'", true));
+
+        j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+        // us runs as dev, who may build ds but has no job/cancel on it
+        QueueItemAuthenticatorConfiguration.get().getAuthenticators().add(new MockQueueItemAuthenticator(
+                Map.of("us", User.getById("dev", true).impersonate())));
+        j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
+                .grant(Jenkins.READ, Computer.BUILD).everywhere().to("dev")
+                .grant(Item.READ, Item.BUILD).onItems(ds).to("dev"));
+
+        WorkflowRun usb = us.scheduleBuild2(0).getStartCondition().get();
+        await().until(() -> ds.getLastBuild() != null && ds.getLastBuild().isBuilding());
+        FreeStyleBuild dsb = ds.getLastBuild();
+
+        usb.doStop();
+        j.assertBuildStatus(Result.ABORTED, j.waitForCompletion(usb));
+
+        // dev lacks job/cancel on ds, so the downstream must keep running and a permission message is logged
+        j.assertLogContains("dev is missing the Job/Cancel permission to abort ds", usb);
+        assertTrue(dsb.isBuilding(), "downstream ds should still be running");
+
+        dsb.getExecutor().interrupt();
+    }
+
+    @Issue("SECURITY-3870")
+    @Test
+    void abortWithoutCancelPermissionDoesNotCancelQueuedDownstream() throws Exception {
+        FreeStyleProject ds = j.createFreeStyleProject("ds");
+        ds.getBuildersList().add(new SleepBuilder(Long.MAX_VALUE));
+        WorkflowJob us = j.jenkins.createProject(WorkflowJob.class, "us");
+        us.setDefinition(new CpsFlowDefinition("build 'ds'", true));
+
+        j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+        QueueItemAuthenticatorConfiguration.get().getAuthenticators().add(new MockQueueItemAuthenticator(
+                Map.of("us", User.getById("dev", true).impersonate())));
+        j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
+                .grant(Jenkins.READ, Computer.BUILD).everywhere().to("dev")
+                .grant(Item.READ, Item.BUILD).onItems(ds).to("dev"));
+
+        // keep ds in the queue rather than letting it start
+        j.jenkins.setNumExecutors(0);
+
+        WorkflowRun usb = us.scheduleBuild2(0).waitForStart();
+        j.waitForMessage("Scheduling project", usb);
+        CpsFlowExecution exec = (CpsFlowExecution) usb.getExecutionPromise().get();
+        // ensure the pipeline has parked at the build step, with ds queued
+        exec.waitForSuspension();
+        assertEquals(1, j.jenkins.getQueue().getItems().length);
+
+        usb.doStop();
+        j.assertBuildStatus(Result.ABORTED, j.waitForCompletion(usb));
+
+        // dev lacks job/cancel on ds, so the queued item must survive and a permission message is logged
+        j.assertLogContains("dev is missing the Job/Cancel permission to abort ds", usb);
+        assertThat(j.jenkins.getQueue().getItems(), arrayWithSize(1));
+
+        j.jenkins.getQueue().clear();
     }
 
     private static ParameterValue getParameter(Run<?, ?> run, String parameterName) {
